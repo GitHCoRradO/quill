@@ -1,10 +1,10 @@
-package io.getquill.context.monix
+package io.getquill
 
-import io.getquill.Spec
-import monix.eval.Task
-import monix.execution.Scheduler
-import monix.execution.schedulers.CanBlock
-import org.scalatest.Matchers._
+import zio.Exit.Failure
+import zio.Task
+import io.getquill.context.zio.Runner
+import zio.{ Chunk, FiberRef, Task, UIO, ZIO }
+import org.scalatest.matchers.should.Matchers._
 
 import scala.util.Failure
 
@@ -15,8 +15,6 @@ class RunnerSpec extends Spec {
     def apply() = state = 1
     def applied = state == 1
   }
-
-  implicit val scheduler = Scheduler.global
 
   "plain runner" - {
     val runner = Runner.default
@@ -62,7 +60,6 @@ class RunnerSpec extends Spec {
     val prefix = "quill-test-pool"
     val customScheduler = Scheduler.io(prefix)
     val runner = Runner.using(customScheduler)
-    import runner._
 
     "should run in specified scheduler" in {
       // the global scheduler is imported but want to explicitly tell this to run on it, just for clarity

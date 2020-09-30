@@ -1,17 +1,17 @@
 package io.getquill.context.zio
 
 import java.io.Closeable
-import java.sql.{Array => _, _}
+import java.sql.{ Array => _, _ }
 
-import io.getquill.{NamingStrategy, ReturnAction}
+import io.getquill.{ NamingStrategy, ReturnAction }
 import io.getquill.context.StreamingContext
 import io.getquill.context.jdbc.JdbcContextBase
 import io.getquill.context.sql.idiom.SqlIdiom
 import io.getquill.util.ContextLogger
 import javax.sql.DataSource
-import zio.Exit.{Failure, Success}
-import zio.{Chunk, FiberRef, Task, UIO, ZIO}
-import zio.stream.{Stream, ZStream}
+import zio.Exit.{ Failure, Success }
+import zio.{ Chunk, FiberRef, Task, UIO, ZIO }
+import zio.stream.{ Stream, ZStream }
 
 import scala.collection.mutable
 import scala.util.Try
@@ -264,6 +264,7 @@ abstract class ZioJdbcContext[Dialect <: SqlIdiom, Naming <: NamingStrategy](
               }
             if (hasNext) {
               try {
+                // TODO Is it safe to do a toArray on a whole slice of Array?
                 val arr = it.take(fetchSize).toArray
                 Chunk.fromArray(arr)
               } catch {
