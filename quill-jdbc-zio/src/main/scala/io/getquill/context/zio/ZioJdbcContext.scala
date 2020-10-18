@@ -10,19 +10,16 @@ import io.getquill.context.sql.idiom.SqlIdiom
 import io.getquill.util.ContextLogger
 import javax.sql.DataSource
 import zio.Exit.{ Failure, Success }
-import zio.{ Chunk, FiberRef, Task, UIO, ZIO }
+import zio.{ Chunk, FiberRef, RIO, Task, UIO, URIO, ZIO, ZManaged }
 import zio.stream.{ Stream, ZStream }
 
-import scala.collection.mutable
 import scala.util.Try
 
 /**
  * Quill context that wraps all JDBC calls in `monix.eval.Task`.
  *
  */
-abstract class ZioJdbcContext[Dialect <: SqlIdiom, Naming <: NamingStrategy](
-  dataSource: DataSource with Closeable, runner: Runner
-) extends ZioContext[Dialect, Naming]
+abstract class ZioJdbcContext[Dialect <: SqlIdiom, Naming <: NamingStrategy] extends ZioContext[Dialect, Naming]
   with JdbcContextBase[Dialect, Naming]
   with StreamingContext[Dialect, Naming]
   with ZioTranslateContext {
@@ -39,135 +36,68 @@ abstract class ZioJdbcContext[Dialect <: SqlIdiom, Naming <: NamingStrategy](
   override type RunBatchActionReturningResult[T] = List[T]
 
   // Need explicit return-type annotations due to scala/bug#8356. Otherwise macro system will not understand Result[Long]=Task[Long] etc...
-  override def executeAction[T](sql: String, prepare: Prepare = identityPrepare): Task[Long] =
+  override def executeAction[T](sql: String, prepare: Prepare = identityPrepare): RIO[Connection, Long] =
     super.executeAction(sql, prepare)
-  override def executeQuery[T](sql: String, prepare: Prepare = identityPrepare, extractor: Extractor[T] = identityExtractor): Task[List[T]] =
+  override def executeQuery[T](sql: String, prepare: Prepare = identityPrepare, extractor: Extractor[T] = identityExtractor): RIO[Connection, List[T]] =
     super.executeQuery(sql, prepare, extractor)
-  override def executeQuerySingle[T](sql: String, prepare: Prepare = identityPrepare, extractor: Extractor[T] = identityExtractor): Task[T] =
+  override def executeQuerySingle[T](sql: String, prepare: Prepare = identityPrepare, extractor: Extractor[T] = identityExtractor): RIO[Connection, T] =
     super.executeQuerySingle(sql, prepare, extractor)
-  override def executeActionReturning[O](sql: String, prepare: Prepare = identityPrepare, extractor: Extractor[O], returningBehavior: ReturnAction): Task[O] =
+  override def executeActionReturning[O](sql: String, prepare: Prepare = identityPrepare, extractor: Extractor[O], returningBehavior: ReturnAction): RIO[Connection, O] =
     super.executeActionReturning(sql, prepare, extractor, returningBehavior)
-  override def executeBatchAction(groups: List[BatchGroup]): Task[List[Long]] =
+  override def executeBatchAction(groups: List[BatchGroup]): RIO[Connection, List[Long]] =
     super.executeBatchAction(groups)
-  override def executeBatchActionReturning[T](groups: List[BatchGroupReturning], extractor: Extractor[T]): Task[List[T]] =
+  override def executeBatchActionReturning[T](groups: List[BatchGroupReturning], extractor: Extractor[T]): RIO[Connection, List[T]] =
     super.executeBatchActionReturning(groups, extractor)
-  override def prepareQuery[T](sql: String, prepare: Prepare, extractor: Extractor[T] = identityExtractor): Connection => Task[PreparedStatement] =
+  override def prepareQuery[T](sql: String, prepare: Prepare, extractor: Extractor[T] = identityExtractor): Connection => RIO[Connection, PreparedStatement] =
     super.prepareQuery(sql, prepare, extractor)
-  override def prepareAction(sql: String, prepare: Prepare): Connection => Task[PreparedStatement] =
+  override def prepareAction(sql: String, prepare: Prepare): Connection => RIO[Connection, PreparedStatement] =
     super.prepareAction(sql, prepare)
-  override def prepareBatchAction(groups: List[BatchGroup]): Connection => Task[List[PreparedStatement]] =
+  override def prepareBatchAction(groups: List[BatchGroup]): Connection => RIO[Connection, List[PreparedStatement]] =
     super.prepareBatchAction(groups)
 
-  override protected val effect: Runner = runner
+  override protected val effect: Runner = Runner.default
   import effect._
 
-  private val currentConnection: UIO[FiberRef[Option[Connection]]] = FiberRef.make(None)
+  /** ZIO Contexts do not managed DB connections so this is a no-op */
+  override def close(): Unit = ()
 
-  override def close(): Unit = dataSource.close()
+  protected def withConnection[T](f: Connection => Result[T]): Result[T] = throw new IllegalArgumentException("Not Used")
+  override protected def withConnectionWrapped[T](f: Connection => T): RIO[Connection, T] =
+    RIO.fromFunction(f) // TODO fromFunctionM and ZIO.effectBlocking?
 
-  override protected def withConnection[T](f: Connection => Task[T]): Task[T] =
-    for {
-      maybeConnectionRef <- currentConnection
-      maybeConnection <- maybeConnectionRef.get
-      result <- maybeConnection match {
-        case Some(connection) => f(connection)
-        case None =>
-          schedule {
-            wrap(dataSource.getConnection).bracket(conn => wrapClose(conn.close()))(f)
-          }
-      }
-    } yield result
-
-  protected def withConnectionObservable[T](f: Connection => Stream[Throwable, T]): Stream[Throwable, T] =
-    for {
-      maybeConnectionRef <- Stream.fromEffect(currentConnection)
-      maybeConnection <- Stream.fromEffect(maybeConnectionRef.get)
-      result <- maybeConnection match {
-        case Some(connection) =>
-          withAutocommitBracket(connection, f)
-        case None =>
-          Stream.bracket(
-            Task(dataSource.getConnection)
-          )(conn => wrapClose(conn.close())).flatMap(conn => // Note: Can use mapM instead
-              withAutocommitBracket(conn, f))
-      }
-    } yield result
-
-  /**
-   * Need to store, set and restore the client's autocommit mode since some vendors (e.g. postgres)
-   * don't like autocommit=true during streaming sessions. Using brackets to do that.
-   */
-  private[getquill] def withAutocommitBracket[T](conn: Connection, f: Connection => Stream[Throwable, T]): Stream[Throwable, T] = {
-    Stream.bracket(Task(autocommitOff(conn)))(autoCommitBackOn)
-      .flatMap({ case (conn, _) => f(conn) })
+  trait SameThreadExecutionContext extends scala.concurrent.ExecutionContext {
+    def submit(runnable: Runnable): Unit =
+      runnable.run()
   }
 
-  private[getquill] def withAutocommitBracket[T](conn: Connection, f: Connection => Task[T]): Task[T] = {
-    Task(autocommitOff(conn))
-      .bracket(autoCommitBackOn)({ case (conn, _) => f(conn) })
+  def transaction[A](f: RIO[Connection, A]): RIO[Connection, A] = {
+    def die = Task.die(new IllegalStateException("The task was cancelled in the middle of a transaction."))
+    ZIO.environment[Connection].flatMap(conn =>
+      f.onInterrupt(die).onExit {
+        case Success(_) =>
+          UIO(conn.commit())
+        case Failure(cause) =>
+          // TODO Are we really catching the result of the conn.rollback() Task's exception?
+          catchAll(Task(conn.rollback()) *> Task.halt(cause))
+      })
   }
 
-  private[getquill] def withCloseBracket[T](conn: Connection, f: Connection => Task[T]): Task[T] = {
-    Task(conn)
-      .bracket(conn => wrapClose(conn.close()))(conn => f(conn))
-  }
-
-  private[getquill] def autocommitOff(conn: Connection): (Connection, Boolean) = {
-    val ac = conn.getAutoCommit;
-    conn.setAutoCommit(false);
-    (conn, ac)
-  }
-
-  private[getquill] def autoCommitBackOn(state: (Connection, Boolean)) = {
-    val (conn, wasAutocommit) = state
-    wrapClose(conn.setAutoCommit(wasAutocommit))
-  }
-
-  def transaction[A](f: Task[A]): Task[A] = {
-    val dbEffects = for {
-      connectionRef <- currentConnection
-      connection <- connectionRef.get
-      result <- connection match {
-        case Some(_) => f // Already in a transaction
-        case None =>
-          wrap(dataSource.getConnection).bracket { conn =>
-            // TODO This returns UIO, is that correct?
-            connectionRef.set(None)
-          } { conn =>
-            withCloseBracket(conn, conn => {
-              withAutocommitBracket(conn, conn => {
-                wrap(conn).flatMap { conn =>
-                  connectionRef.set(Some(conn))
-                  f.onInterrupt(Task.die(new IllegalStateException(
-                    "The task was cancelled in the middle of a transaction."
-                  ))).onExit {
-                    case Success(_) =>
-                      wrapClose(conn.commit())
-                    case Failure(cause) =>
-                      // TODO Are we really catching the result of the conn.rollback() Task's exception?
-                      catchAll(Task(conn.rollback()) *> Task.halt(cause))
-                  }
-                }
-              })
-            })
-          }
-      }
-    } yield result
-
-    boundary {
-      schedule(dbEffects)
-    }
-  }
+  def probingDataSource: Option[DataSource] = None
 
   // Override with sync implementation so will actually be able to do it.
-  override def probe(sql: String): Try[_] = Try {
-    val c = dataSource.getConnection
-    try {
-      c.createStatement().execute(sql)
-    } finally {
-      c.close()
+  override def probe(sql: String): Try[_] =
+    probingDataSource match {
+      case Some(dataSource) =>
+        Try {
+          val c = dataSource.getConnection
+          try {
+            c.createStatement().execute(sql)
+          } finally {
+            c.close()
+          }
+        }
+      case None => Try()
     }
-  }
 
   /**
    * In order to allow a ResultSet to be consumed by an Observable, a ResultSet iterator must be created.
@@ -227,28 +157,41 @@ abstract class ZioJdbcContext[Dialect <: SqlIdiom, Naming <: NamingStrategy](
     stmt
   }
 
-  def streamQuery[T](fetchSize: Option[Int], sql: String, prepare: Prepare = identityPrepare, extractor: Extractor[T] = identityExtractor): Stream[Throwable, T] =
-    withConnectionObservable { conn =>
-      Stream.bracket({
-        Task {
-          val stmt = prepareStatementForStreaming(sql, conn, fetchSize)
-          val (params, ps) = prepare(stmt)
-          logger.logQuery(sql, params)
-          ps.executeQuery()
-        }
-      })({ rs =>
-        wrapClose(rs.close())
-      }).flatMap { rs =>
-        val iter = new ResultSetIterator(rs, extractor)
-        fetchSize match {
-          // TODO Assuming chunk size is fetch size. Not sure if this is optimal. Maybe introduce some switches to control this?
-          case Some(size) =>
-            chunkedFetch(iter, size)
-          case None =>
-            Stream.fromIterator(new ResultSetIterator(rs, extractor))
+  def streamQuery[T](fetchSize: Option[Int], sql: String, prepare: Prepare = identityPrepare, extractor: Extractor[T] = identityExtractor): ZStream[Connection, Throwable, T] = {
+    def prepareStatement(conn: Connection) = {
+      val stmt = prepareStatementForStreaming(sql, conn, fetchSize)
+      val (params, ps) = prepare(stmt)
+      logger.logQuery(sql, params)
+      ps
+    }
+
+    val managedEnv: ZStream[Connection, Throwable, (Connection, PrepareRow, ResultSet)] =
+      ZStream.environment[Connection].flatMap { conn =>
+        ZStream.managed {
+          for {
+            conn <- ZManaged.make(Task(conn))(c => Task.unit)
+            ps <- ZManaged.make(Task(prepareStatement(conn)))(ps => wrapClose(ps.close()))
+            rs <- ZManaged.make(Task(ps.executeQuery()))(rs => wrapClose(rs))
+          } yield (conn, ps, rs)
         }
       }
-    }
+
+    val ret: ZStream[Connection, Throwable, T] =
+      managedEnv.flatMap {
+        case (conn, ps, rs) =>
+          val iter = new ResultSetIterator(rs, extractor)
+          fetchSize match {
+            // TODO Assuming chunk size is fetch size. Not sure if this is optimal.
+            //      Maybe introduce some switches to control this?
+            case Some(size) =>
+              chunkedFetch(iter, size)
+            case None =>
+              Stream.fromIterator(new ResultSetIterator(rs, extractor))
+          }
+      }
+
+    ret
+  }
 
   def chunkedFetch[T](iter: ResultSetIterator[T], fetchSize: Int) = {
     object StreamEnd extends Throwable
@@ -280,7 +223,7 @@ abstract class ZioJdbcContext[Dialect <: SqlIdiom, Naming <: NamingStrategy](
     }
   }
 
-  override private[getquill] def prepareParams(statement: String, prepare: Prepare): Task[Seq[String]] = {
+  override private[getquill] def prepareParams(statement: String, prepare: Prepare): RIO[Connection, Seq[String]] = {
     withConnectionWrapped { conn =>
       prepare(conn.prepareStatement(statement))._1.reverse.map(prepareParam)
     }

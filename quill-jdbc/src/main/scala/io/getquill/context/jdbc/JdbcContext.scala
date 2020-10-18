@@ -14,6 +14,7 @@ import io.getquill.monad.SyncIOMonad
 
 abstract class JdbcContext[Dialect <: SqlIdiom, Naming <: NamingStrategy]
   extends JdbcContextBase[Dialect, Naming]
+  with JdbcContext[Dialect, Naming]
   with TranslateContext
   with SyncIOMonad {
 

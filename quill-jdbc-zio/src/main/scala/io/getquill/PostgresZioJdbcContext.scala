@@ -1,22 +1,22 @@
 package io.getquill
 
-import java.io.Closeable
-
 import com.typesafe.config.Config
 import io.getquill.context.jdbc.PostgresJdbcContextBase
-import io.getquill.context.zio.{ ZioJdbcContext, Runner }
+import io.getquill.context.zio.ZioJdbcContext
 import io.getquill.util.LoadConfig
 import javax.sql.DataSource
 
 class PostgresZioJdbcContext[N <: NamingStrategy](
-  val naming:     N,
-  val dataSource: DataSource with Closeable,
-  runner:         Runner
-) extends ZioJdbcContext[PostgresDialect, N](dataSource, runner)
-  with PostgresJdbcContextBase[N] {
+  val naming: N
+) extends ZioJdbcContext[PostgresDialect, N]
+  with PostgresJdbcContextBase[N]
 
-  def this(naming: N, config: JdbcContextConfig, runner: Runner) = this(naming, config.dataSource, runner)
-  def this(naming: N, config: Config, runner: Runner) = this(naming, JdbcContextConfig(config), runner)
-  def this(naming: N, configPrefix: String, runner: Runner) = this(naming, LoadConfig(configPrefix), runner)
-  def this(naming: N, configPrefix: String) = this(naming, LoadConfig(configPrefix), Runner.default)
+object PostgresZioJdbcContext {
+  def withProbeable[N](naming: N, config: Config): PostgresZioJdbcContext[N] =
+    new PostgresZioJdbcContext[N](naming) {
+      override def probingDataSource: Option[DataSource] = Some(JdbcContextConfig(config).dataSource)
+    }
+  def withProbeable[N](naming: N, configPrefix: String): PostgresZioJdbcContext[N] =
+    PostgresZioJdbcContext.withProbeable[N](naming, LoadConfig(configPrefix))
 }
+

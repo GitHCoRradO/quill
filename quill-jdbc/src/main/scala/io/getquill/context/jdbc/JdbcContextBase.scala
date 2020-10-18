@@ -12,6 +12,7 @@ import io.getquill.util.ContextLogger
 trait JdbcContextBase[Dialect <: SqlIdiom, Naming <: NamingStrategy]
   extends Context[Dialect, Naming]
   with SqlContext[Dialect, Naming]
+  with JdbcPrepareBase[Dialect, Naming]
   with Encoders
   with Decoders {
   private[getquill] val logger = ContextLogger(classOf[JdbcContext[_, _]])
